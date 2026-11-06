@@ -1,19 +1,20 @@
 const http = require('http');
 const { Transform } = require('stream');
 
-// ================= KONFIGURASI SERVER =================
-const DEBUG_MODE = true; // Set ke false untuk mematikan log payload di terminal server
-const UNWRAPPER_PORT = 4000; // Port tujuan proxy_pass dari Nginx
-const AI_BACKEND_HOST = '127.0.0.1';
-const AI_BACKEND_PORT = 20128; // Port Backend AI (misal: 9router / LiteLLM)
-const SECRET_KEY = Buffer.from('KunciRahasia123!@#'); // Wajib sama persis dengan di client
-// ======================================================
+// ================= KONFIGURASI SERVER (DOCKER ENV) =================
+const DEBUG_MODE = process.env.DEBUG_MODE === 'true';
+const UNWRAPPER_PORT = parseInt(process.env.UNWRAPPER_PORT || '4000', 10);
+// Nama container backend AI di jaringan Docker (misal: '9router')
+const AI_BACKEND_HOST = process.env.AI_BACKEND_HOST || '9router';
+const AI_BACKEND_PORT = parseInt(process.env.AI_BACKEND_PORT || '20128', 10);
+const SECRET_KEY = Buffer.from(process.env.SECRET_KEY || 'KunciRahasia123!@#');
+// ===================================================================
 
 function createXorStream(keyBuffer, mode, debugLabel = '') {
 	let offset = 0;
 	let isFirstChunk = true;
 	let loggedBytes = 0;
-	const MAX_DEBUG_BYTES = 4096; // Batas cetak log request (4KB) agar console server tidak penuh oleh Base64 image
+	const MAX_DEBUG_BYTES = 4096;
 
 	return new Transform({
 		transform(chunk, encoding, callback) {
@@ -38,7 +39,7 @@ function createXorStream(keyBuffer, mode, debugLabel = '') {
 					loggedBytes += chunk.length;
 
 					if (isRequest && loggedBytes >= MAX_DEBUG_BYTES) {
-						process.stdout.write(`\n... [PAYLOAD TRUNCATED DI CONSOLE (${chunk.length} bytes chunk) - STREAM TETAP BERJALAN PENUH] ...`);
+						process.stdout.write(`\n... [PAYLOAD TRUNCATED (${chunk.length} bytes) - STREAM TETAP BERJALAN] ...`);
 					}
 				}
 			}
@@ -82,7 +83,7 @@ const server = http.createServer((req, res) => {
 		delete headers['x-telemetry-id'];
 	}
 
-	// 2. Pulihkan semua header sensitif AI (Authorization, x-api-key, anthropic-*, openai-*)
+	// 2. Pulihkan semua header sensitif AI
 	if (headers['x-session-token']) {
 		try {
 			const restoredHeaders = JSON.parse(hexToXor(headers['x-session-token'], SECRET_KEY));
@@ -93,7 +94,7 @@ const server = http.createServer((req, res) => {
 		delete headers['x-session-token'];
 	}
 
-	// 3. Pulihkan Content-Type asli (misal: application/json atau multipart/form-data)
+	// 3. Pulihkan Content-Type asli
 	if (headers['x-meta-type']) {
 		headers['content-type'] = hexToXor(headers['x-meta-type'], SECRET_KEY);
 		delete headers['x-meta-type'];
@@ -119,25 +120,22 @@ const server = http.createServer((req, res) => {
 			console.log(`[SERVER UNWRAP] Backend Status: ${backendRes.statusCode} | Content-Type: ${resHeaders['content-type']}`);
 		}
 
-		// Samarkan kembali Content-Type response menjadi binary stream sebelum melewati Nginx
 		if (resHeaders['content-type']) {
 			resHeaders['x-meta-type'] = xorToHex(resHeaders['content-type'], SECRET_KEY);
 			resHeaders['content-type'] = 'application/octet-stream';
 		}
 
-		// Pastikan Nginx tidak menahan buffer SSE Streaming
 		resHeaders['x-accel-buffering'] = 'no';
 		resHeaders['cache-control'] = 'no-cache, no-transform';
 
 		res.writeHead(backendRes.statusCode, resHeaders);
 
-		// Enkripsi stream response dari Backend AI sebelum dikirim balik ke Client
 		const encryptStream = createXorStream(SECRET_KEY, 'encrypt', `RESPONSE (${originalUrl})`);
 		backendRes.pipe(encryptStream).pipe(res, { end: true });
 	});
 
 	backendReq.on('error', (err) => {
-		console.error(`[BACKEND ERROR] ${err.message}`);
+		console.error(`[BACKEND ERROR] Gagal menghubungi ${AI_BACKEND_HOST}:${AI_BACKEND_PORT} - ${err.message}`);
 		if (!res.headersSent) {
 			res.writeHead(502, { 'Content-Type': 'text/plain' });
 			res.end(`Bad Gateway: ${err.message}`);
@@ -148,14 +146,14 @@ const server = http.createServer((req, res) => {
 
 	req.on('aborted', () => backendReq.destroy());
 
-	// Dekripsi stream request yang masuk dari Nginx sebelum diteruskan ke Backend AI
 	const decryptStream = createXorStream(SECRET_KEY, 'decrypt', `REQUEST (${originalUrl})`);
 	req.pipe(decryptStream).pipe(backendReq, { end: true });
 });
 
-server.listen(UNWRAPPER_PORT, '127.0.0.1', () => {
+// WAJIB '0.0.0.0' agar bisa diakses oleh container Nginx
+server.listen(UNWRAPPER_PORT, '0.0.0.0', () => {
 	console.log(`================================================================`);
-	console.log(`🔓 Server Unwrapper berjalan di : http://127.0.0.1:${UNWRAPPER_PORT}`);
+	console.log(`🔓 Server Unwrapper berjalan di : http://0.0.0.0:${UNWRAPPER_PORT}`);
 	console.log(`🤖 AI Backend Target            : http://${AI_BACKEND_HOST}:${AI_BACKEND_PORT}`);
 	console.log(`🐞 Debug Mode                   : ${DEBUG_MODE}`);
 	console.log(`================================================================`);
